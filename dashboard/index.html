@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>5G-NOC Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  body {
+    background: #0d1117;
+    color: #e6edf3;
+    font-family: 'Segoe UI', sans-serif;
+    margin: 0;
+    padding: 20px;
+  }
+  h1 { color: #58a6ff; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h3 { margin-top: 0; color: #58a6ff; }
+  .metric-row { display: flex; justify-content: space-between; margin: 4px 0; font-size: 14px; }
+  .status-ok { color: #3fb950; }
+  .status-warn { color: #d29922; }
+  #alerts {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .alert-item {
+    background: #2d1214;
+    border-left: 3px solid #f85149;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  #connection-status {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    margin-left: 12px;
+  }
+  .connected { background: #1a4d2e; color: #3fb950; }
+  .disconnected { background: #4d1a1a; color: #f85149; }
+  canvas { max-height: 200px; }
+</style>
+</head>
+<body>
+
+<h1>5G-NOC — Network Operations Center
+  <span id="connection-status" class="disconnected">Disconnected</span>
+</h1>
+
+<h2>Live Network Elements</h2>
+<div class="grid" id="element-cards"></div>
+
+<h2>Latency Trend</h2>
+<div class="card">
+  <canvas id="latencyChart"></canvas>
+</div>
+
+<h2>🚨 Alerts</h2>
+<div id="alerts"><p style="color:#8b949e">No alerts yet — monitoring...</p></div>
+
+<script>
+const elementData = {}; // element_id -> latest telemetry
+const alertsLog = [];
+const latencyHistory = {}; // element_id -> array of {t, latency}
+
+const chartCtx = document.getElementById('latencyChart').getContext('2d');
+const chart = new Chart(chartCtx, {
+  type: 'line',
+  data: { datasets: [] },
+  options: {
+    responsive: true,
+    animation: false,
+    scales: {
+      x: { type: 'linear', ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+      y: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' }, title: { display: true, text: 'Latency (ms)', color: '#8b949e' } }
+    },
+    plugins: { legend: { labels: { color: '#e6edf3' } } }
+  }
+});
+
+const colors = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#bc8cff'];
+let colorIndex = 0;
+function colorFor(id) {
+  if (!colorFor.map) colorFor.map = {};
+  if (!colorFor.map[id]) colorFor.map[id] = colors[colorIndex++ % colors.length];
+  return colorFor.map[id];
+}
+
+function renderCards() {
+  const container = document.getElementById('element-cards');
+  container.innerHTML = '';
+  Object.values(elementData).forEach(t => {
+    const isWarn = t.latency_ms > 80 || t.packet_loss_pct > 3;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <h3>${t.element_id} <span style="font-size:12px;color:#8b949e">(${t.element_type})</span></h3>
+      <div class="metric-row"><span>Latency</span><span class="${isWarn ? 'status-warn' : 'status-ok'}">${t.latency_ms.toFixed(1)} ms</span></div>
+      <div class="metric-row"><span>Throughput</span><span>${t.throughput_mbps.toFixed(0)} Mbps</span></div>
+      <div class="metric-row"><span>Packet Loss</span><span class="${isWarn ? 'status-warn' : 'status-ok'}">${t.packet_loss_pct.toFixed(2)}%</span></div>
+      <div class="metric-row"><span>CPU</span><span>${t.cpu_usage_pct.toFixed(0)}%</span></div>
+      <div class="metric-row"><span>Memory</span><span>${t.memory_usage_pct.toFixed(0)}%</span></div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+function updateChart() {
+  chart.data.datasets = Object.keys(latencyHistory).map(id => ({
+    label: id,
+    data: latencyHistory[id],
+    borderColor: colorFor(id),
+    backgroundColor: 'transparent',
+    tension: 0.2,
+    pointRadius: 0
+  }));
+  chart.update('none');
+}
+
+function addAlert(alert) {
+  alertsLog.unshift(alert);
+  if (alertsLog.length > 30) alertsLog.pop();
+  const container = document.getElementById('alerts');
+  container.innerHTML = alertsLog.map(a => `
+    <div class="alert-item">
+      <strong>${a.element_id}</strong> — ${a.reason}<br>
+      <span style="color:#8b949e">${new Date(a.timestamp).toLocaleTimeString()}</span>
+    </div>
+  `).join('');
+}
+
+let tCounter = 0;
+
+function connect() {
+  const ws = new WebSocket('ws://localhost:8082/ws');
+  const statusEl = document.getElementById('connection-status');
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected';
+    statusEl.className = 'connected';
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Disconnected — retrying...';
+    statusEl.className = 'disconnected';
+    setTimeout(connect, 2000); // auto-reconnect
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'telemetry') {
+      tCounter++;
+      msg.data.forEach(t => {
+        elementData[t.element_id] = t;
+        if (!latencyHistory[t.element_id]) latencyHistory[t.element_id] = [];
+        latencyHistory[t.element_id].push({ x: tCounter, y: t.latency_ms });
+        if (latencyHistory[t.element_id].length > 30) latencyHistory[t.element_id].shift();
+      });
+      renderCards();
+      updateChart();
+    }
+
+    if (msg.type === 'alert') {
+      addAlert(msg.data);
+    }
+  };
+}
+
+connect();
+</script>
+
+</body>
+</html>

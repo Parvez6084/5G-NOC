@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -8,6 +9,7 @@ import (
 	"time"
 )
 
+const alertURL = "http://localhost:8082/alerts"
 const collectorRecentURL = "http://localhost:8081/telemetry/recent"
 const windowSize = 20       // how many past readings per element to remember
 const stdDevThreshold = 2.0 // flag if reading is > this many std devs above mean
@@ -121,6 +123,21 @@ func checkAnomaly(t Telemetry) (bool, string) {
 	return isAnomaly, reason
 }
 
+func sendAlert(elementID, reason string) {
+	alert := map[string]interface{}{
+		"element_id": elementID,
+		"reason":     reason,
+		"timestamp":  time.Now(),
+	}
+	body, _ := json.Marshal(alert)
+	resp, err := http.Post(alertURL, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		fmt.Println("failed to send alert to gateway:", err)
+		return
+	}
+	resp.Body.Close()
+}
+
 func main() {
 	fmt.Println("5G-NOC Anomaly Engine started. Polling", collectorRecentURL)
 
@@ -148,6 +165,7 @@ func main() {
 			isAnomaly, reason := checkAnomaly(t)
 			if isAnomaly {
 				fmt.Printf("🚨 ALERT [%s]: %s\n", t.ElementID, reason)
+				sendAlert(t.ElementID, reason)
 			}
 		}
 	}
