@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const collectorRecentURL = "http://localhost:8081/telemetry/recent"
@@ -40,6 +43,34 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true }, // fine for local dev
 }
 
+var (
+	wsConnectionsActive = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "noc_gateway_ws_connections_active",
+			Help: "Current number of connected WebSocket dashboard clients",
+		},
+	)
+
+	wsMessagesBroadcast = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "noc_gateway_ws_messages_broadcast_total",
+			Help: "Total WebSocket messages broadcast, by message type",
+		},
+		[]string{"type"},
+	)
+
+	alertsReceived = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "noc_gateway_alerts_received_total",
+			Help: "Total alerts received from anomaly engines",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(wsConnectionsActive, wsMessagesBroadcast, alertsReceived)
+}
+
 // hub manages all connected WebSocket clients safely across goroutines
 type hub struct {
 	mu      sync.Mutex
@@ -54,6 +85,7 @@ func (h *hub) add(conn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients[conn] = true
+	wsConnectionsActive.Set(float64(len(h.clients)))
 }
 
 func (h *hub) remove(conn *websocket.Conn) {
@@ -61,12 +93,14 @@ func (h *hub) remove(conn *websocket.Conn) {
 	defer h.mu.Unlock()
 	delete(h.clients, conn)
 	conn.Close()
+	wsConnectionsActive.Set(float64(len(h.clients)))
 }
 
 // broadcast sends a message to every connected client, dropping any that error out
 func (h *hub) broadcast(msg wsMessage) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	wsMessagesBroadcast.WithLabelValues(msg.Type).Inc()
 	for conn := range h.clients {
 		if err := conn.WriteJSON(msg); err != nil {
 			conn.Close()
@@ -108,6 +142,7 @@ func handleAlert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	alertsReceived.Inc()
 	connections.broadcast(wsMessage{Type: "alert", Data: a})
 	w.WriteHeader(http.StatusOK)
 }
@@ -139,6 +174,7 @@ func main() {
 
 	http.HandleFunc("/ws", handleWS)
 	http.HandleFunc("/alerts", handleAlert)
+	http.Handle("/metrics", promhttp.Handler()) // NEW
 
 	fmt.Println("API Gateway listening on :8082 (WebSocket at /ws)")
 	log.Fatal(http.ListenAndServe(":8082", nil))

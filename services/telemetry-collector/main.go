@@ -14,6 +14,9 @@ import (
 
 	"google.golang.org/grpc"
 	_ "modernc.org/sqlite"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Telemetry mirrors the struct used by the HTTP endpoints
@@ -65,6 +68,8 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetryReceived.WithLabelValues(t.ElementType, "http").Inc()
+
 	if err := insertTelemetry(t); err != nil {
 		http.Error(w, "failed to insert: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -103,12 +108,14 @@ func handleRecent(w http.ResponseWriter, r *http.Request) {
 
 // insertTelemetry is shared by both the HTTP and gRPC paths
 func insertTelemetry(t Telemetry) error {
+	start := time.Now()
 	_, err := db.Exec(
 		`INSERT INTO telemetry (element_id, element_type, timestamp, latency_ms, throughput_mbps, packet_loss_pct, cpu_usage_pct, memory_usage_pct)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ElementID, t.ElementType, t.Timestamp.Format(time.RFC3339),
 		t.LatencyMs, t.ThroughputMbps, t.PacketLossPct, t.CPUUsagePct, t.MemoryUsagePct,
 	)
+	telemetryInsertDuration.Observe(time.Since(start).Seconds())
 	return err
 }
 
@@ -129,6 +136,8 @@ func (s *grpcServer) SendTelemetry(ctx context.Context, r *pb.TelemetryReading) 
 		CPUUsagePct:    r.CpuUsagePct,
 		MemoryUsagePct: r.MemoryUsagePct,
 	}
+
+	telemetryReceived.WithLabelValues(t.ElementType, "grpc").Inc()
 
 	if err := insertTelemetry(t); err != nil {
 		return &pb.TelemetryAck{Stored: false, Message: err.Error()}, nil
@@ -151,6 +160,36 @@ func startGRPCServer() {
 	}
 }
 
+var (
+	telemetryReceived = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "noc_telemetry_received_total",
+			Help: "Total telemetry readings received, by element type and protocol",
+		},
+		[]string{"element_type", "protocol"},
+	)
+
+	telemetryInsertDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "noc_telemetry_insert_duration_seconds",
+			Help:    "Time taken to insert a telemetry reading into SQLite",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "noc_http_requests_total",
+			Help: "Total HTTP requests, by endpoint and status",
+		},
+		[]string{"endpoint", "status"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(telemetryReceived, telemetryInsertDuration, httpRequestsTotal)
+}
+
 // ---------- main ----------
 
 func main() {
@@ -161,6 +200,7 @@ func main() {
 
 	http.HandleFunc("/telemetry", handleIngest)
 	http.HandleFunc("/telemetry/recent", handleRecent)
+	http.Handle("/metrics", promhttp.Handler()) // NEW
 
 	log.Println("Telemetry Collector (HTTP) listening on :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
