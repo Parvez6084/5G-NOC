@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package telemetry;
+
+option go_package = "netpulse/proto";
+
+import "google/protobuf/timestamp.proto";
+
+// TelemetryService lets network elements stream metrics to the collector.
+service TelemetryService {
+  // SendTelemetry sends a single reading and gets back an ack.
+  rpc SendTelemetry(TelemetryReading) returns (TelemetryAck);
+}
+
+message TelemetryReading {
+  string element_id = 1;
+  string element_type = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  double latency_ms = 4;
+  double throughput_mbps = 5;
+  double packet_loss_pct = 6;
+  double cpu_usage_pct = 7;
+  double memory_usage_pct = 8;
+}
+
+message TelemetryAck {
+  bool stored = 1;
+  string message = 2;
+}

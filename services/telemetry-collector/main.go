@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
 
+	pb "netpulse/proto"
+
+	"google.golang.org/grpc"
 	_ "modernc.org/sqlite"
 )
 
-// Telemetry mirrors the struct sent by the simulator service
+// Telemetry mirrors the struct used by the HTTP endpoints
 type Telemetry struct {
 	ElementID      string    `json:"element_id"`
 	ElementType    string    `json:"element_type"`
@@ -32,7 +37,6 @@ func initDB() {
 		log.Fatal("failed to open database:", err)
 	}
 
-	// SQLite only supports one writer at a time — force the pool to serialize access
 	db.SetMaxOpenConns(1)
 
 	schema, err := os.ReadFile("schema.sql")
@@ -47,7 +51,8 @@ func initDB() {
 	log.Println("Database initialized: telemetry.db")
 }
 
-// handleIngest receives a telemetry reading via POST and stores it
+// ---------- HTTP handlers (kept for testing/debugging + dashboard reads) ----------
+
 func handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -60,13 +65,7 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec(
-		`INSERT INTO telemetry (element_id, element_type, timestamp, latency_ms, throughput_mbps, packet_loss_pct, cpu_usage_pct, memory_usage_pct)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ElementID, t.ElementType, t.Timestamp.Format(time.RFC3339),
-		t.LatencyMs, t.ThroughputMbps, t.PacketLossPct, t.CPUUsagePct, t.MemoryUsagePct,
-	)
-	if err != nil {
+	if err := insertTelemetry(t); err != nil {
 		http.Error(w, "failed to insert: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -75,7 +74,6 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"stored"}`))
 }
 
-// handleRecent returns the most recent telemetry readings
 func handleRecent(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(
 		`SELECT element_id, element_type, timestamp, latency_ms, throughput_mbps, packet_loss_pct, cpu_usage_pct, memory_usage_pct
@@ -103,13 +101,67 @@ func handleRecent(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
+// insertTelemetry is shared by both the HTTP and gRPC paths
+func insertTelemetry(t Telemetry) error {
+	_, err := db.Exec(
+		`INSERT INTO telemetry (element_id, element_type, timestamp, latency_ms, throughput_mbps, packet_loss_pct, cpu_usage_pct, memory_usage_pct)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ElementID, t.ElementType, t.Timestamp.Format(time.RFC3339),
+		t.LatencyMs, t.ThroughputMbps, t.PacketLossPct, t.CPUUsagePct, t.MemoryUsagePct,
+	)
+	return err
+}
+
+// ---------- gRPC server ----------
+
+type grpcServer struct {
+	pb.UnimplementedTelemetryServiceServer
+}
+
+func (s *grpcServer) SendTelemetry(ctx context.Context, r *pb.TelemetryReading) (*pb.TelemetryAck, error) {
+	t := Telemetry{
+		ElementID:      r.ElementId,
+		ElementType:    r.ElementType,
+		Timestamp:      r.Timestamp.AsTime(),
+		LatencyMs:      r.LatencyMs,
+		ThroughputMbps: r.ThroughputMbps,
+		PacketLossPct:  r.PacketLossPct,
+		CPUUsagePct:    r.CpuUsagePct,
+		MemoryUsagePct: r.MemoryUsagePct,
+	}
+
+	if err := insertTelemetry(t); err != nil {
+		return &pb.TelemetryAck{Stored: false, Message: err.Error()}, nil
+	}
+	return &pb.TelemetryAck{Stored: true, Message: "ok"}, nil
+}
+
+func startGRPCServer() {
+	lis, err := net.Listen("tcp", ":9090")
+	if err != nil {
+		log.Fatal("failed to listen on :9090:", err)
+	}
+
+	grpcSrv := grpc.NewServer()
+	pb.RegisterTelemetryServiceServer(grpcSrv, &grpcServer{})
+
+	log.Println("gRPC server listening on :9090")
+	if err := grpcSrv.Serve(lis); err != nil {
+		log.Fatal("grpc serve error:", err)
+	}
+}
+
+// ---------- main ----------
+
 func main() {
 	initDB()
 	defer db.Close()
 
-	http.HandleFunc("/telemetry", handleIngest)        // POST to store
-	http.HandleFunc("/telemetry/recent", handleRecent) // GET to query
+	go startGRPCServer()
 
-	log.Println("Telemetry Collector listening on :8081")
+	http.HandleFunc("/telemetry", handleIngest)
+	http.HandleFunc("/telemetry/recent", handleRecent)
+
+	log.Println("Telemetry Collector (HTTP) listening on :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
 }

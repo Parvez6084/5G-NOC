@@ -1,35 +1,26 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"time"
+
+	pb "netpulse/proto"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const collectorURL = "http://localhost:8081/telemetry"
+const collectorAddr = "localhost:9090"
 
-// NetworkElement represents a simulated 5G infrastructure node
 type NetworkElement struct {
 	ID   string
-	Type string // "base-station", "core-node", "edge-device"
+	Type string
 }
 
-// Telemetry represents a single metrics snapshot from a network element
-type Telemetry struct {
-	ElementID      string    `json:"element_id"`
-	ElementType    string    `json:"element_type"`
-	Timestamp      time.Time `json:"timestamp"`
-	LatencyMs      float64   `json:"latency_ms"`
-	ThroughputMbps float64   `json:"throughput_mbps"`
-	PacketLossPct  float64   `json:"packet_loss_pct"`
-	CPUUsagePct    float64   `json:"cpu_usage_pct"`
-	MemoryUsagePct float64   `json:"memory_usage_pct"`
-}
-
-func generateTelemetry(e NetworkElement) Telemetry {
+func generateTelemetry(e NetworkElement) *pb.TelemetryReading {
 	isAnomaly := rand.Float64() < 0.05
 
 	latency := 10 + rand.Float64()*20
@@ -40,38 +31,19 @@ func generateTelemetry(e NetworkElement) Telemetry {
 		packetLoss += 5 + rand.Float64()*10
 	}
 
-	return Telemetry{
-		ElementID:      e.ID,
+	return &pb.TelemetryReading{
+		ElementId:      e.ID,
 		ElementType:    e.Type,
-		Timestamp:      time.Now(),
+		Timestamp:      timestamppb.Now(),
 		LatencyMs:      latency,
 		ThroughputMbps: 50 + rand.Float64()*450,
 		PacketLossPct:  packetLoss,
-		CPUUsagePct:    20 + rand.Float64()*60,
+		CpuUsagePct:    20 + rand.Float64()*60,
 		MemoryUsagePct: 30 + rand.Float64()*50,
 	}
 }
 
-// sendTelemetry POSTs a telemetry reading to the Collector service
-func sendTelemetry(t Telemetry) error {
-	body, err := json.Marshal(t)
-	if err != nil {
-		return err
-	}
-
-	resp, err := http.Post(collectorURL, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("collector returned status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func runElement(e NetworkElement, done <-chan struct{}) {
+func runElement(e NetworkElement, client pb.TelemetryServiceClient, done <-chan struct{}) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -79,11 +51,15 @@ func runElement(e NetworkElement, done <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			t := generateTelemetry(e)
-			if err := sendTelemetry(t); err != nil {
-				fmt.Printf("[%s] failed to send telemetry: %v\n", e.ID, err)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ack, err := client.SendTelemetry(ctx, t)
+			cancel()
+
+			if err != nil {
+				fmt.Printf("[%s] gRPC send failed: %v\n", e.ID, err)
 				continue
 			}
-			fmt.Printf("[%s] sent: latency=%.1fms loss=%.2f%%\n", e.ID, t.LatencyMs, t.PacketLossPct)
+			fmt.Printf("[%s] sent via gRPC: latency=%.1fms loss=%.2f%% (ack: %s)\n", e.ID, t.LatencyMs, t.PacketLossPct, ack.Message)
 		case <-done:
 			return
 		}
@@ -91,6 +67,15 @@ func runElement(e NetworkElement, done <-chan struct{}) {
 }
 
 func main() {
+	conn, err := grpc.NewClient(collectorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Println("failed to connect to collector via gRPC:", err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewTelemetryServiceClient(conn)
+
 	elements := []NetworkElement{
 		{ID: "bs-001", Type: "base-station"},
 		{ID: "bs-002", Type: "base-station"},
@@ -100,12 +85,12 @@ func main() {
 
 	done := make(chan struct{})
 
-	fmt.Println("5G-NOC Telemetry Simulator started. Sending to", collectorURL)
+	fmt.Println("5G-NOC Telemetry Simulator started. Sending via gRPC to", collectorAddr)
 	fmt.Println("Press Ctrl+C to stop.")
 
 	for _, e := range elements {
-		go runElement(e, done)
+		go runElement(e, client, done)
 	}
 
-	<-done // blocks forever until we implement graceful shutdown
+	<-done
 }
