@@ -1,0 +1,10 @@
+{
+  "element_id": "bs-001",
+  "element_type": "base-station",
+  "timestamp": "2026-07-17T10:00:00Z",
+  "latency_ms": 15.2,
+  "throughput_mbps": 200,
+  "packet_loss_pct": 0.1,
+  "cpu_usage_pct": 40,
+  "memory_usage_pct": 55
+}
