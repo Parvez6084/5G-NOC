@@ -32,6 +32,9 @@ func initDB() {
 		log.Fatal("failed to open database:", err)
 	}
 
+	// SQLite only supports one writer at a time — force the pool to serialize access
+	db.SetMaxOpenConns(1)
+
 	schema, err := os.ReadFile("schema.sql")
 	if err != nil {
 		log.Fatal("failed to read schema.sql:", err)
