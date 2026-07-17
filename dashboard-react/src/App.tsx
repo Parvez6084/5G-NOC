@@ -27,7 +27,13 @@ export default function App() {
     }
 
     if (msg.type === 'alert') {
-      setAlerts((prev) => [msg.data, ...prev].slice(0, 30));
+       setAlerts((prev) => {
+        const isDupe = prev[0]?.element_id === msg.data.element_id &&
+                      prev[0]?.reason === msg.data.reason &&
+                      prev[0]?.timestamp === msg.data.timestamp;
+        if (isDupe) return prev;
+        return [msg.data, ...prev].slice(0, 30);
+      });
     }
   });
 
