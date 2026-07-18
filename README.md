@@ -9,7 +9,7 @@ Built as a hands-on exploration of the architecture patterns used in telecom net
 ## Live Demo
 
 ![Dashboard screenshot](docs/dashboard-screenshot.gif)
-*(add your dashboard screenshot here before publishing)*
+
 
 ---
 
