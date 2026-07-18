@@ -1,18 +1,21 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const alertURL = "http://localhost:8082/alerts"
 const collectorRecentURL = "http://localhost:8081/telemetry/recent"
-const windowSize = 20       // how many past readings per element to remember
-const stdDevThreshold = 2.0 // flag if reading is > this many std devs above mean
+const alertURL = "http://localhost:8082/alerts"
+const windowSize = 20
+const stdDevThreshold = 2.0
 
 type Telemetry struct {
 	ElementID      string    `json:"element_id"`
@@ -25,14 +28,38 @@ type Telemetry struct {
 	MemoryUsagePct float64   `json:"memory_usage_pct"`
 }
 
-// elementHistory keeps a rolling window of past readings for one network element
 type elementHistory struct {
 	latencies    []float64
 	packetLosses []float64
 }
 
-// history tracks rolling windows per element_id
 var history = make(map[string]*elementHistory)
+
+// ---------- Prometheus metrics ----------
+
+var (
+	readingsProcessed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "noc_anomaly_engine_readings_processed_total",
+			Help: "Total telemetry readings processed by the statistical detector, by element",
+		},
+		[]string{"element_id"},
+	)
+
+	anomaliesDetected = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "noc_anomaly_engine_anomalies_detected_total",
+			Help: "Total anomalies detected, by element",
+		},
+		[]string{"element_id"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(readingsProcessed, anomaliesDetected)
+}
+
+// ---------- helpers ----------
 
 func fetchRecent() ([]Telemetry, error) {
 	resp, err := http.Get(collectorRecentURL)
@@ -48,7 +75,6 @@ func fetchRecent() ([]Telemetry, error) {
 	return results, nil
 }
 
-// mean calculates the average of a slice of float64
 func mean(vals []float64) float64 {
 	if len(vals) == 0 {
 		return 0
@@ -60,7 +86,6 @@ func mean(vals []float64) float64 {
 	return sum / float64(len(vals))
 }
 
-// stdDev calculates the standard deviation of a slice of float64
 func stdDev(vals []float64, m float64) float64 {
 	if len(vals) < 2 {
 		return 0
@@ -73,7 +98,6 @@ func stdDev(vals []float64, m float64) float64 {
 	return math.Sqrt(sumSq / float64(len(vals)-1))
 }
 
-// pushWindow adds a new value to a rolling window, capped at windowSize
 func pushWindow(window []float64, val float64) []float64 {
 	window = append(window, val)
 	if len(window) > windowSize {
@@ -82,8 +106,6 @@ func pushWindow(window []float64, val float64) []float64 {
 	return window
 }
 
-// checkAnomaly compares a new reading against the rolling history for its element.
-// Returns (isAnomaly, reason) — only evaluates once we have enough history to judge fairly.
 func checkAnomaly(t Telemetry) (bool, string) {
 	h, exists := history[t.ElementID]
 	if !exists {
@@ -94,7 +116,6 @@ func checkAnomaly(t Telemetry) (bool, string) {
 	isAnomaly := false
 	reason := ""
 
-	// Only judge once we have a meaningful baseline (avoid false positives on cold start)
 	if len(h.latencies) >= 5 {
 		m := mean(h.latencies)
 		sd := stdDev(h.latencies, m)
@@ -116,7 +137,6 @@ func checkAnomaly(t Telemetry) (bool, string) {
 		}
 	}
 
-	// Update rolling windows AFTER checking, so the current reading doesn't skew its own baseline
 	h.latencies = pushWindow(h.latencies, t.LatencyMs)
 	h.packetLosses = pushWindow(h.packetLosses, t.PacketLossPct)
 
@@ -130,7 +150,7 @@ func sendAlert(elementID, reason string) {
 		"timestamp":  time.Now(),
 	}
 	body, _ := json.Marshal(alert)
-	resp, err := http.Post(alertURL, "application/json", bytes.NewBuffer(body))
+	resp, err := http.Post(alertURL, "application/json", jsonReader(body))
 	if err != nil {
 		fmt.Println("failed to send alert to gateway:", err)
 		return
@@ -138,13 +158,40 @@ func sendAlert(elementID, reason string) {
 	resp.Body.Close()
 }
 
+// small helper so we don't need a separate "bytes" import alias issue
+func jsonReader(b []byte) *jsonBodyReader {
+	return &jsonBodyReader{data: b}
+}
+
+type jsonBodyReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *jsonBodyReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, fmt.Errorf("EOF")
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// ---------- main ----------
+
 func main() {
 	fmt.Println("5G-NOC Anomaly Engine started. Polling", collectorRecentURL)
+
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("Anomaly Engine metrics listening on :8084")
+		log.Fatal(http.ListenAndServe(":8084", nil))
+	}()
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	seen := make(map[string]bool) // avoid re-processing the same reading twice (rough dedup by timestamp+element)
+	seen := make(map[string]bool)
 
 	for range ticker.C {
 		readings, err := fetchRecent()
@@ -153,7 +200,6 @@ func main() {
 			continue
 		}
 
-		// Process oldest to newest so rolling windows build up in correct order
 		for i := len(readings) - 1; i >= 0; i-- {
 			t := readings[i]
 			key := t.ElementID + t.Timestamp.String()
@@ -162,8 +208,11 @@ func main() {
 			}
 			seen[key] = true
 
+			readingsProcessed.WithLabelValues(t.ElementID).Inc()
+
 			isAnomaly, reason := checkAnomaly(t)
 			if isAnomaly {
+				anomaliesDetected.WithLabelValues(t.ElementID).Inc()
 				fmt.Printf("🚨 ALERT [%s]: %s\n", t.ElementID, reason)
 				sendAlert(t.ElementID, reason)
 			}
